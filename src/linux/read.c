@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <string.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <darling/emulation/linux_premigration/ext/for-libkqueue.h>
@@ -106,6 +107,35 @@ evfilt_read_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     }
 
     dbg_printf("epoll: %s", epoll_event_dump(ev));
+#ifdef DARLING
+    /* x86Code: Linux reports a stream socket that was never connected as hung up (TCP_CLOSE), so EVFILT_READ fired
+     * with EV_EOF at once. XNU's soreadable() is false for it (not connected, nothing received, no error, receiving
+     * not shut down). Network.framework registers EVFILT_READ before connect() and took that EOF as the flow failing:
+     * every NSURLSession request ended in ENETDOWN (NSURLErrorNotConnectedToInternet). Such an event is dropped. */
+    if ((ev->events & (EPOLLHUP | EPOLLRDHUP)) && !(ev->events & (EPOLLIN | EPOLLERR))
+            && !(src->kn_flags & (KNFL_PASSIVE_SOCKET | KNFL_REGULAR_FILE))) {
+        struct socket_state_4libkqueue st;
+        /* the event may also be stale: epoll_wait() took it before connect() and the connection is up by now
+         * (the socket no longer hangs up): that EOF is dropped too */
+        struct pollfd now = { .fd = src->kdata.kn_dupfd, .events = POLLIN | POLLOUT };
+        int stale = poll(&now, 1, 0) == 1 && !(now.revents & (POLLIN | POLLHUP | POLLERR));
+        if (_socket_state_4libkqueue(src->kdata.kn_dupfd, &st) == 0
+                && (stale || ((st.state & ~SOSTATE_EVCONNINFO) == 0 && st.error == 0))) {
+            dst->filter = EVFILT_DROP;
+            /* EV_DISPATCH/EV_ONESHOT (EPOLLONESHOT): epoll disarmed the descriptor for this event, which the program
+             * never sees, so it never re-enables it: arm it again, edge-triggered, so the hang-up doesn't fire again
+             * but the connection's readiness does (the program's EV_ENABLE restores the knote's own events) */
+            if (src->data.events & EPOLLONESHOT) {
+                struct epoll_event rearm;
+                memset(&rearm, 0, sizeof(rearm));
+                rearm.events = src->data.events | EPOLLET;
+                rearm.data.ptr = src;
+                (void) epoll_ctl(src->kn_epollfd, EPOLL_CTL_MOD, src->kdata.kn_dupfd, &rearm);
+            }
+            return (0);
+        }
+    }
+#endif
     kevent_int_to_64(&src->kev, dst);
 #if defined(HAVE_EPOLLRDHUP)
     if (ev->events & EPOLLRDHUP || ev->events & EPOLLHUP)
@@ -114,8 +144,7 @@ evfilt_read_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     if (ev->events & EPOLLHUP)
         dst->flags |= EV_EOF;
 #endif
-    if (ev->events & EPOLLERR)
-        dst->fflags = 1; /* FIXME: Return the actual socket error */
+    dst->fflags = linux_socket_eof_error(src, ev->events);
           
     if (src->kn_flags & KNFL_PASSIVE_SOCKET) {
         /* On return, data contains the length of the 

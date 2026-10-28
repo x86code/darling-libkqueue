@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <string.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <darling/emulation/linux_premigration/ext/for-libkqueue.h>
@@ -38,6 +39,33 @@ evfilt_socket_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     struct epoll_event * const ev = (struct epoll_event *) ptr;
 
     epoll_event_dump(ev);
+#ifdef DARLING
+    /* x86Code: Linux reports a stream socket that was never connected as writable and hung up (TCP_CLOSE); XNU's
+     * sowriteable() is false for it (PR_CONNREQUIRED, not connected, no error). Network.framework took that EV_EOF as
+     * the flow failing (ENETDOWN). Dropped, as EVFILT_READ's (read.c). */
+    if ((ev->events & EPOLLHUP) && !(ev->events & EPOLLERR)) {
+        struct socket_state_4libkqueue st;
+        /* the event may also be stale: epoll_wait() took it before connect() and the connection is up by now
+         * (the socket no longer hangs up): that EOF is dropped too */
+        struct pollfd now = { .fd = src->kdata.kn_dupfd, .events = POLLIN | POLLOUT };
+        int stale = poll(&now, 1, 0) == 1 && !(now.revents & (POLLHUP | POLLERR));
+        if (_socket_state_4libkqueue(src->kdata.kn_dupfd, &st) == 0
+                && (stale || ((st.state & ~SOSTATE_EVCONNINFO) == 0 && st.error == 0))) {
+            dst->filter = EVFILT_DROP;
+            /* EV_DISPATCH/EV_ONESHOT (EPOLLONESHOT): epoll disarmed the descriptor for this event, which the program
+             * never sees, so it never re-enables it: arm it again, edge-triggered, so the hang-up doesn't fire again
+             * but the connection's readiness does (the program's EV_ENABLE restores the knote's own events) */
+            if (src->data.events & EPOLLONESHOT) {
+                struct epoll_event rearm;
+                memset(&rearm, 0, sizeof(rearm));
+                rearm.events = src->data.events | EPOLLET;
+                rearm.data.ptr = src;
+                (void) epoll_ctl(src->kn_epollfd, EPOLL_CTL_MOD, src->kdata.kn_dupfd, &rearm);
+            }
+            return (0);
+        }
+    }
+#endif
     kevent_int_to_64(&src->kev, dst);
 #if defined(HAVE_EPOLLRDHUP)
     if (ev->events & EPOLLRDHUP || ev->events & EPOLLHUP)
@@ -46,14 +74,20 @@ evfilt_socket_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     if (ev->events & EPOLLHUP)
         dst->flags |= EV_EOF;
 #endif
-    if (ev->events & EPOLLERR)
-        dst->fflags = 1; /* FIXME: Return the actual socket error */
+    dst->fflags = linux_socket_eof_error(src, ev->events);
           
-    /* On return, data contains the the amount of space remaining in the write buffer */
-    if (ioctl(dst->ident, TIOCOUTQ, &dst->data) < 0) {
-            /* race condition with socket close, so ignore this error */
-            dbg_puts("ioctl(2) of socket failed");
-            dst->data = 0;
+    /* On return, data contains the the amount of space remaining in the write buffer.
+     * x86Code: TIOCOUTQ is the bytes queued, not the space left (XNU's sbspace()), so an idle socket reported 0 and
+     * Network.framework never wrote (an NSURLSession TLS handshake stalled after connect). The space is SO_SNDBUF less
+     * what is queued, at least 1 while epoll says writable. */
+    {
+        int queued = 0, sndbuf = 0;
+        socklen_t len = sizeof(sndbuf);
+        if (ioctl(src->kdata.kn_dupfd, TIOCOUTQ, &queued) < 0)
+            queued = 0;
+        if (getsockopt(src->kdata.kn_dupfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &len) < 0)
+            sndbuf = 0;
+        dst->data = sndbuf > queued ? sndbuf - queued : 1;
     }
 
     return (0);
