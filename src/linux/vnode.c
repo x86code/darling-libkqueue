@@ -95,7 +95,16 @@ add_watch(struct filter *filt, struct knote *kn)
         return (-1);
 
     /* Convert the fflags to the inotify mask */
+#ifdef DARLING
+    /*
+     * x86Code: not IN_CLOSE. The watch is on the file (inode), so IN_CLOSE fired whenever any process closed it
+     * (cfprefsd reading a plist), and copyout then deleted the knote. Darling's close() hook (kqueue_closed_fd)
+     * already drops the knotes of a descriptor this process closes, as XNU does.
+     */
+    mask = 0;
+#else
     mask = IN_CLOSE;
+#endif
     if (kn->kev.fflags & NOTE_DELETE)
         mask |= IN_ATTRIB | IN_DELETE_SELF;
     if (kn->kev.fflags & NOTE_WRITE)      
@@ -107,6 +116,10 @@ add_watch(struct filter *filt, struct knote *kn)
         mask |= IN_ATTRIB;
     if (kn->kev.fflags & NOTE_RENAME)
         mask |= IN_MOVE_SELF;
+#ifdef DARLING
+    if (mask == 0) /* x86Code: inotify needs some event; copyout drops events that map to no requested fflags */
+        mask = IN_DELETE_SELF;
+#endif
     if (kn->kev.flags & EV_ONESHOT)
         mask |= IN_ONESHOT;
 
@@ -116,11 +129,35 @@ add_watch(struct filter *filt, struct knote *kn)
         dbg_perror("inotify_init(2)");
         return (-1);
     }
+#ifdef DARLING
+    /* x86Code: non-blocking, so a copyout with nothing left to read can't hang the kevent caller */
+    (void) fcntl(ifd, F_SETFL, O_NONBLOCK);
+#endif
 
     /* Add the watch */
     dbg_printf("inotify_add_watch(2); inofd=%d, %s, path=%s", 
             ifd, inotify_mask_dump(mask), path);
+#ifdef DARLING
+    /*
+     * x86Code: the path read from /proc/<pid>/fd/<n> is a Linux path, and Darling's inotify_add_watch() expands every
+     * path into the prefix: a file outside it (/home/... -> <prefix>/home/...) was never found, the kevent failed
+     * and libdispatch crashed the process (fileproviderd: the simulator's memory-pressure source is a vnode watch on
+     * $SIMULATOR_MEMORY_WARNINGS). Watch the open file itself, through Linux's /proc/self/fd/<n> magic link.
+     */
+    {
+        char fdpath[64];
+        long r;
+        snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", (int) kn->kev.ident);
+        r = __linux_syscall(254 /* __NR_inotify_add_watch, x86-64 */, ifd, (long) fdpath, mask);
+        if (r < 0) {
+            errno = (r == -2) ? ENOENT : (r == -13) ? EACCES : (r == -28) ? ENOSPC : EINVAL;
+            kn->kev.data = -1;
+        } else
+            kn->kev.data = r;
+    }
+#else
     kn->kev.data = inotify_add_watch(ifd, path, mask);
+#endif
     if (kn->kev.data < 0) {
         dbg_perror("inotify_add_watch(2)");
         goto errout;
@@ -168,8 +205,16 @@ evfilt_vnode_copyout(struct kevent64_s *dst, struct knote *src, void *ptr UNUSED
     struct inotify_event* evt = (struct inotify_event*) __builtin_alloca(sizeof(struct inotify_event) + 255 + 1);
     struct stat sb;
 
-    if (get_one_event(evt, src->kdata.kn_inotifyfd) < 0)
+    if (get_one_event(evt, src->kdata.kn_inotifyfd) < 0) {
+#ifdef DARLING
+        /* x86Code: nothing to read (another thread took it; the descriptor is non-blocking): not an error, which
+           would abort() in linux_kevent_copyout */
+        dst->filter = EVFILT_DROP;
+        return (0);
+#else
         return (-1);
+#endif
+    }
 
     dbg_printf("inotify event: %s", inotify_event_dump(evt));
     if (evt->mask & IN_IGNORED) {
@@ -190,6 +235,9 @@ scriptors reference the same file.
 
     kevent_int_to_64(&src->kev, dst);
     dst->data = 0;
+#ifdef DARLING
+    dst->fflags = 0; /* x86Code: report what happened, not every requested flag (filled in below) */
+#endif
 
     /* No error checking because fstat(2) should rarely fail */
     //FIXME: EINTR
@@ -227,6 +275,11 @@ scriptors reference the same file.
     if (evt->mask & IN_DELETE_SELF && src->kev.fflags & NOTE_DELETE) 
         dst->fflags |= NOTE_DELETE;
 
+#ifdef DARLING
+    /* x86Code: an event none of the requested fflags cover (XNU wouldn't fire) */
+    if (dst->fflags == 0)
+        dst->filter = EVFILT_DROP;
+#endif
     return (0);
 }
 
@@ -242,6 +295,9 @@ evfilt_vnode_knote_create(struct filter *filt, struct knote *kn)
     kn->data.vnode.nlink = sb.st_nlink;
     kn->data.vnode.size = sb.st_size;
     kn->kev.data = -1;
+#ifdef DARLING
+    kn->kdata.kn_inotifyfd = -1; /* x86Code: no watch yet (see evfilt_vnode_knote_enable) */
+#endif
 
     return (add_watch(filt, kn));
 }
@@ -250,10 +306,26 @@ int
 evfilt_vnode_knote_modify(struct filter *filt, struct knote *kn, 
         const struct kevent64_s *kev)
 {
+#ifdef DARLING
+    /*
+     * x86Code: EV_ADD on an existing vnode knote takes the new fflags (XNU's filt_vntouch). It was a stub that
+     * failed, so libdispatch saw the update as an error (LIBDISPATCH_STRICT processes such as fileproviderd crash on
+     * any kevent error).
+     */
+    if (kev->fflags == kn->kev.fflags && kn->kdata.kn_inotifyfd >= 0)
+        return (0);
+    kn->kev.fflags = kev->fflags;
+    if (kn->kev.flags & EV_DISABLE)
+        return (0);
+    if (delete_watch(filt, kn) < 0)
+        return (-1);
+    return (add_watch(filt, kn));
+#else
     (void)filt;
     (void)kn;
     (void)kev;
     return (-1); /* FIXME - STUB */
+#endif
 }
 
 int
@@ -265,6 +337,16 @@ evfilt_vnode_knote_delete(struct filter *filt, struct knote *kn)
 int
 evfilt_vnode_knote_enable(struct filter *filt, struct knote *kn)
 {
+#ifdef DARLING
+    /*
+     * x86Code: EV_ENABLE on a knote that is already watching. add_watch() made a second inotify instance and lost
+     * the first (still open, still in the epoll set): every re-enable leaked one, until inotify_init() failed with
+     * EMFILE (the per-user instance limit) and the next vnode EV_ADD in any simulator process failed
+     * (fileproviderd: "vnode add" EMFILE, crashed by LIBDISPATCH_STRICT).
+     */
+    if (kn->kdata.kn_inotifyfd >= 0)
+        return (0);
+#endif
     return add_watch(filt, kn);
 }
 

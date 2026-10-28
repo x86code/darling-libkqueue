@@ -34,6 +34,14 @@
 
 #include "private.h"
 
+/*
+ * Messages are received together with the event (MACH_RCV_MSG in fflags) into this
+ * per-knote buffer, like XNU receives into a workqueue thread's stack. It used to be
+ * 64 bytes, so anything bigger came back as MACH_RCV_TOO_LARGE and had to be received
+ * again by the caller (x86Code).
+ */
+#define MACHPORT_RECEIVE_BUFFER_SIZE (16 * 1024)
+
 int
 evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
 {
@@ -46,8 +54,14 @@ evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     epoll_event_dump(ev);
     kevent_int_to_64(&src->kev, dst);
 
-	// first, read the notification
-	rv = recv(src->kdata.kn_dupfd, &notification, sizeof(notification), 0);
+	// first, read the notification. x86Code: without blocking: a modification may have
+	// consumed it (see evfilt_machport_knote_modify) after epoll reported it; then
+	// there is nothing to deliver (the server notifies again if events remain)
+	rv = recv(src->kdata.kn_dupfd, &notification, sizeof(notification), MSG_DONTWAIT);
+	if (rv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+		dst->filter = EVFILT_DROP;
+		return 0;
+	}
 	if (rv < 0) {
 		dbg_printf("evfilt_machport_copyout() reading notification failed: %d (%s)", errno, strerror(errno));
 		return -1;
@@ -62,8 +76,8 @@ evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
 	call.header.number = dserver_kqchan_msgnum_mach_port_read;
 	call.header.pid = getpid();
 	call.header.tid = THREAD_ID;
-	call.default_buffer = (uint64_t)&src->kn_extra_buffer[0];
-	call.default_buffer_size = sizeof(src->kn_extra_buffer);
+	call.default_buffer = (uint64_t)src->kn_extra_buffer;
+	call.default_buffer_size = MACHPORT_RECEIVE_BUFFER_SIZE;
 	rv = send(src->kdata.kn_dupfd, &call, sizeof(call), 0);
 	if (rv < 0) {
 		dbg_printf("evfilt_machport_copyout() sending request failed: %d (%s)", errno, strerror(errno));
@@ -122,9 +136,15 @@ evfilt_machport_knote_create(struct filter *filt, struct knote *kn)
     ev.events = kn->data.events;
     ev.data.ptr = kn;
 
+	kn->kn_extra_buffer = malloc(MACHPORT_RECEIVE_BUFFER_SIZE);
+	if (kn->kn_extra_buffer == NULL)
+		return (-1);
+
 	int status = _dserver_rpc_kqchan_mach_port_open_4libkqueue(port, (void*)kn->kev.ext[0], kn->kev.ext[1], kn->kev.fflags, &kn->kdata.kn_dupfd);
 	if (status < 0) {
 		dbg_printf("evfilt_machport_open: %s", strerror(-status));
+		free(kn->kn_extra_buffer);
+		kn->kn_extra_buffer = NULL;
 		return (-1);
 	}
 
@@ -134,6 +154,10 @@ evfilt_machport_knote_create(struct filter *filt, struct knote *kn)
 
     if (epoll_ctl(kn->kn_epollfd, EPOLL_CTL_ADD, kn->kdata.kn_dupfd, &ev) < 0) {
         dbg_printf("epoll_ctl(2): %s", strerror(errno));
+        (void) __close_for_kqueue(kn->kdata.kn_dupfd);
+        kn->kdata.kn_dupfd = -1;
+        free(kn->kn_extra_buffer);
+        kn->kn_extra_buffer = NULL;
         return (-1);
     }
     return 0;
@@ -160,10 +184,23 @@ evfilt_machport_knote_modify(struct filter *filt, struct knote *kn,
 		return -1;
 	}
 
-	rv = recv(kn->kdata.kn_dupfd, &reply, sizeof(reply), 0);
-	if (rv < 0) {
-		dbg_printf("evfilt_machport_knote_modify recv failed: %d (%s)", errno, strerror(errno));
-		return -1;
+	// x86Code: a notification may already be queued ahead of the reply; skip it (the
+	// server treats the modification as acknowledging it and notifies again afterwards
+	// if events are still pending). Reading it as the reply used to lose it for good.
+	for (;;) {
+		union {
+			dserver_kqchan_reply_mach_port_modify_t reply;
+			dserver_kqchan_call_notification_t notification;
+		} msg = {0};
+		rv = recv(kn->kdata.kn_dupfd, &msg, sizeof(msg), 0);
+		if (rv < 0) {
+			dbg_printf("evfilt_machport_knote_modify recv failed: %d (%s)", errno, strerror(errno));
+			return -1;
+		}
+		if (msg.notification.header.number == dserver_kqchan_msgnum_notification)
+			continue;
+		reply = msg.reply;
+		break;
 	}
 
 	if (reply.header.number != dserver_kqchan_msgnum_mach_port_modify) {
@@ -192,6 +229,8 @@ evfilt_machport_knote_delete(struct filter *filt, struct knote *kn)
 
 	(void) __close_for_kqueue(kn->kdata.kn_dupfd);
 	kn->kdata.kn_dupfd = -1;
+	free(kn->kn_extra_buffer);
+	kn->kn_extra_buffer = NULL;
 	return 0;
 }
 

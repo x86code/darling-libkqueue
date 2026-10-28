@@ -123,6 +123,14 @@ endif (DARLING)
 if(STATIC_KQUEUE)
 	add_darling_object_library(kqueue ${SRC} ${INCL})
 	make_fat(kqueue)
+
+	# x86Code: standalone libkqueue for processes on a foreign libSystem (iOS simulator),
+	# injected with DYLD_INSERT_LIBRARIES and looked up by libsystem_kernel
+	set(DYLIB_INSTALL_NAME "/usr/lib/darling/libkqueue_sim.dylib")
+	add_darling_library(kqueue_sim $<TARGET_OBJECTS:kqueue>) # objects include src/darling/sim_exports.c
+	target_link_libraries(kqueue_sim PRIVATE system)
+	make_fat(kqueue_sim)
+	install(TARGETS kqueue_sim DESTINATION libexec/darling/usr/lib/darling)
 else()
     add_library(kqueue SHARED ${SRC} ${INCL})
 endif()

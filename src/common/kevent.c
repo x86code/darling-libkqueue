@@ -25,8 +25,31 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <string.h>
+#include <time.h>
 
 #include "private.h"
+
+/* now, in nanoseconds of the monotonic clock */
+static uint64_t
+now_ns(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return ((uint64_t) now.tv_sec * 1000000000ull + now.tv_nsec);
+}
+
+/* when a wait of timeout from now ends: UINT64_MAX if not within the clock's range */
+static uint64_t
+deadline_ns(const struct timespec *timeout)
+{
+    uint64_t now = now_ns();
+    uint64_t sec = timeout->tv_sec, nsec = timeout->tv_nsec;
+
+    if (sec > (UINT64_MAX - now - nsec) / 1000000000ull)
+        return (UINT64_MAX);
+    return (now + sec * 1000000000ull + nsec);
+}
 
 static const char *
 kevent_filter_dump(const struct kevent64_s *kev)
@@ -147,9 +170,11 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
             // but at the moment it just confuses clients
             kn->kev.flags &= ~EV_VANISHED;
 
-            if (filt->kn_create(filt, kn) < 0) {
+            // a filter can name the error, as -errno; any other failure is EBADF
+            int created = filt->kn_create(filt, kn);
+            if (created < 0) {
                 knote_release(kn);
-                errno = EBADF;
+                errno = created < -1 ? -created : EBADF;
                 return (-1);
             } 
             knote_insert(filt, kn);
@@ -170,9 +195,39 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
         }
     }
 
+    /*
+     * x86Code: XNU's defer-delete (kevent_register): EV_DELETE without EV_ENABLE on a
+     * disabled EV_DISPATCH2 knote, i.e. one whose event has been delivered and may not
+     * have been processed yet, fails with EINPROGRESS. libdispatch then keeps the unote
+     * until that event is merged and deletes it with EV_DELETE|EV_ENABLE. Deleting at
+     * once let it free the unote (e.g. a mach reply unote when a peer died) while the
+     * event was still queued for a workqueue thread: "API MISUSE: Resurrection of an
+     * object" in _dispatch_kevent_merge, SIGSEGVs on stale unotes (backboardd).
+     */
+    if ((src->flags & (EV_DELETE | EV_ENABLE)) == EV_DELETE &&
+            (kn->kev.flags & EV_DISPATCH2) == EV_DISPATCH2 &&
+            ((kn->kev.flags & EV_DISABLE) || (kn->kn_flags & KNFL_DEFER_DELETE))) {
+        kn->kn_flags |= KNFL_DEFER_DELETE;
+        errno = EINPROGRESS;
+        return (-1);
+    }
+
     if ((src->flags & EV_DELETE) || ((kn->kn_flags & KNFL_DEFER_DELETE) && (src->flags & EV_ENABLE))) {
         rv = knote_delete(filt, kn);
         dbg_printf("knote_delete returned %d", rv);
+    } else if ((src->flags & (EV_ADD | EV_DISABLE)) == EV_ADD && src->filter == EVFILT_TIMER) {
+        /*
+         * x86Code: EV_ADD on an existing timer re-arms it with the new deadline, as XNU's
+         * filt_timertouch does, also when EV_ENABLE comes with it. libdispatch keeps one timer
+         * knote per clock/QoS bucket and moves its deadline with EV_ADD|EV_ENABLE|EV_ONESHOT;
+         * the EV_ENABLE branch below re-armed it with the old deadline, so a 0.2 s
+         * dispatch_after armed while a 25 s one was pending fired after 25 s (Swift
+         * continuations, Task.sleep, CFRunLoop timers all wait on these).
+         */
+        kn->kev.udata = src->udata;
+        rv = filt->kn_modify(filt, kn, src);
+        kn->kev.flags &= ~EV_DISABLE;
+        dbg_printf("kn_modify (timer re-arm) returned %d", rv);
     } else if (src->flags & EV_DISABLE) {
         kn->kev.flags |= EV_DISABLE;
         rv = filt->kn_disable(filt, kn);
@@ -385,6 +440,11 @@ kevent64_impl(int kqfd, const struct kevent64_s *changelist, int nchanges,
         nevents = MAX_KEVENT;
     if ((flags & KEVENT_FLAG_ERROR_EVENTS) == 0 && nevents > 0) {
         const struct timespec* ts = (flags & KEVENT_FLAG_IMMEDIATE) ? (&timeout_zero) : timeout;
+        struct timespec left;
+        uint64_t deadline = 0;
+
+        if (ts != NULL && (ts->tv_sec > 0 || ts->tv_nsec > 0))
+            deadline = deadline_ns(ts);
 again:
         rv = kqops.kevent_wait(kq, nevents, ts);
         dbg_printf("kqops.kevent_wait returned %d", rv);
@@ -399,10 +459,21 @@ again:
         kqueue_unlock(kq);
 
         if (rv == 0) {
-            /* Timeout reached */
-            /* Avoid returning 0 when waiting indefinitely in case of spurious wakeups */
+            /*
+             * Timeout reached, or every event was dropped (a filter found nothing to report): XNU's kevent()
+             * returns 0 only when the timeout expires, so wait for what's left of it
+             */
             if (ts == NULL)
                 goto again;
+            if (deadline != 0 && ret == 0) {
+                uint64_t now = now_ns();
+                if (now < deadline) {
+                    left.tv_sec = (deadline - now) / 1000000000ull;
+                    left.tv_nsec = (deadline - now) % 1000000000ull;
+                    ts = &left;
+                    goto again;
+                }
+            }
         } else {
             dbg_printf("(%u) kevent_wait failed", myid);
             goto out;
