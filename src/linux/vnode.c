@@ -117,6 +117,16 @@ add_watch(struct filter *filt, struct knote *kn)
     if (kn->kev.fflags & NOTE_RENAME)
         mask |= IN_MOVE_SELF;
 #ifdef DARLING
+    /*
+     * x86Code: on a directory, XNU's NOTE_WRITE means an entry was added, removed or renamed. inotify reports those as
+     * IN_CREATE/IN_DELETE/IN_MOVED_FROM/IN_MOVED_TO on the directory's watch (IN_MODIFY there is a child's data
+     * changing, which copyout now ignores). Without this, a directory watch never fired.
+     */
+    {
+        struct stat dsb;
+        if ((kn->kev.fflags & NOTE_WRITE) && fstat(kn->kev.ident, &dsb) == 0 && S_ISDIR(dsb.st_mode))
+            mask |= IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO;
+    }
     if (mask == 0) /* x86Code: inotify needs some event; copyout drops events that map to no requested fflags */
         mask = IN_DELETE_SELF;
 #endif
@@ -237,6 +247,15 @@ scriptors reference the same file.
     dst->data = 0;
 #ifdef DARLING
     dst->fflags = 0; /* x86Code: report what happened, not every requested flag (filled in below) */
+    if (evt->len > 0) {
+        /* x86Code: an event about an entry of a watched directory: only adding, removing or renaming one is a write
+           of the directory (XNU's NOTE_WRITE); a child's own data or attributes changing is not */
+        if ((evt->mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO)) && (src->kev.fflags & NOTE_WRITE))
+            dst->fflags = NOTE_WRITE;
+        else
+            dst->filter = EVFILT_DROP;
+        return (0);
+    }
 #endif
 
     /* No error checking because fstat(2) should rarely fail */
