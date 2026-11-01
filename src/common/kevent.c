@@ -27,6 +27,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <sys/stat.h>
+#include <unistd.h>
 #include "private.h"
 
 /* now, in nanoseconds of the monotonic clock */
@@ -152,6 +154,31 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
 
     kn = knote_lookup(filt, src->ident);
     dbg_printf("knote_lookup: ident %d == %p", (int)src->ident, kn);
+#ifdef DARLING
+    /*
+     * x86Code (Speed 27): a knote watches a duplicate of the program's descriptor (kn_dupfd). XNU drops a file's knotes
+     * when the file is closed; if one survived here (a close libkqueue didn't see, or one deferred), the next file
+     * given the same number found it on EV_ADD and inherited the old file: a new TCP socket's EVFILT_READ reported
+     * the closed mDNSResponder socket's EOF, and Network.framework failed the connection "Network is down". An EV_ADD
+     * whose descriptor is no longer the knote's file replaces the knote.
+     */
+    if (kn != NULL && (src->flags & EV_ADD) && (src->filter == EVFILT_READ || src->filter == EVFILT_WRITE
+            || src->filter == EVFILT_SOCK) && kn->kdata.kn_dupfd >= 0) {
+        struct stat a, b;
+        if (fstat((int) src->ident, &a) == 0 && fstat(kn->kdata.kn_dupfd, &b) == 0
+                && (a.st_dev != b.st_dev || a.st_ino != b.st_ino)) {
+            static int told;
+            if (!told++) {
+                char m[160];
+                int n = snprintf(m, sizeof(m), "libkqueue: stale knote replaced (fd %d filter %d flags 0x%x)\n",
+                    (int) src->ident, src->filter, kn->kev.flags);
+                (void) !write(2, m, n);
+            }
+            knote_delete(filt, kn);
+            kn = NULL;
+        }
+    }
+#endif
     if (kn == NULL) {
         if (src->flags & EV_ADD) {
             if ((kn = knote_new()) == NULL) {

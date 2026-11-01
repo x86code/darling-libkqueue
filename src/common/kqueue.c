@@ -267,14 +267,21 @@ kqueue_closed_fd(int fd)
 	int saved_errno = errno;
 	struct kevent64_s ev[3];
 
+	// x86Code (Speed 27): EV_ENABLE with the deletes: XNU's close() drops every knote on the fd (knote_fdclose),
+	// also a disabled EV_DISPATCH one whose event was delivered. Without it the defer-delete rule (kevent.c: a
+	// program's EV_DELETE on such a knote is EINPROGRESS) kept the knote, with its duplicate of the closed file, and
+	// the next file given the same number inherited it on EV_ADD: a new TCP socket's EVFILT_READ fired at once with
+	// the previous one's EOF (an mDNSResponder socket the DNS reply had closed), and Network.framework failed the
+	// connection "Network is down" (NSURLSession -1009, mobileassetd's catalog and asset downloads at boot).
+	memset(ev, 0, sizeof(ev));
 	ev[0].ident = fd;
-	ev[0].flags = EV_DELETE | EV_RECEIPT;
+	ev[0].flags = EV_DELETE | EV_ENABLE | EV_RECEIPT;
 	ev[0].filter = EVFILT_READ;
 	ev[1].ident = fd;
-	ev[1].flags = EV_DELETE | EV_RECEIPT;
+	ev[1].flags = EV_DELETE | EV_ENABLE | EV_RECEIPT;
 	ev[1].filter = EVFILT_WRITE;
 	ev[2].ident = fd;
-	ev[2].flags = EV_DELETE | EV_RECEIPT;
+	ev[2].flags = EV_DELETE | EV_ENABLE | EV_RECEIPT;
 	ev[2].filter = EVFILT_SOCK;
 
 	// we know it's not a kqueue FD (since kqueue_close() takes care of those),
