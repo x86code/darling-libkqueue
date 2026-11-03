@@ -252,6 +252,7 @@ kqueue_closed_fd_cb(struct kqueue *kq, void *arg)
 	kevent_copyin_one(kq, &ev[0]);
 	kevent_copyin_one(kq, &ev[1]);
 	kevent_copyin_one(kq, &ev[2]);
+	kevent_copyin_one(kq, &ev[3]);
 }
 
 // this function is too expensive for how often it can be called (which is every time an FD is closed).
@@ -265,7 +266,7 @@ kqueue_closed_fd(int fd)
 
 	// close() succeeded, which leaves errno alone; the deletions below set it for each kqueue the fd isn't in
 	int saved_errno = errno;
-	struct kevent64_s ev[3];
+	struct kevent64_s ev[4];
 
 	// x86Code (Speed 27): EV_ENABLE with the deletes: XNU's close() drops every knote on the fd (knote_fdclose),
 	// also a disabled EV_DISPATCH one whose event was delivered. Without it the defer-delete rule (kevent.c: a
@@ -283,6 +284,11 @@ kqueue_closed_fd(int fd)
 	ev[2].ident = fd;
 	ev[2].flags = EV_DELETE | EV_ENABLE | EV_RECEIPT;
 	ev[2].filter = EVFILT_SOCK;
+	// x86Code (fileproviderd vnode): and EVFILT_VNODE. A vnode knote outlived its descriptor, so the next file given
+	// that number found it on EV_ADD (kn_modify: same fflags, nothing to do) and watched the old file.
+	ev[3].ident = fd;
+	ev[3].flags = EV_DELETE | EV_ENABLE | EV_RECEIPT;
+	ev[3].filter = EVFILT_VNODE;
 
 	// we know it's not a kqueue FD (since kqueue_close() takes care of those),
 	// but it could be a fd inside a kqueue. Since we're creating duplicates of all fd's,

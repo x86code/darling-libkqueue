@@ -301,7 +301,14 @@ err_path:
         if (nevents > 0) {
             memcpy(eventlist, src, sizeof(*src));
             eventlist->data = status;
+#ifdef DARLING
+            /* x86Code (fileproviderd vnode): XNU's kevent_register keeps the change's flags and adds EV_ERROR.
+               With EV_ERROR alone libdispatch could not tell an EV_ADD/EV_DELETE error from one on a live knote
+               ("kevent vnode monitor") and skipped its EV_DELETE special cases. */
+            eventlist->flags = src->flags | EV_ERROR;
+#else
             eventlist->flags = EV_ERROR;
+#endif
             nevents--;
             eventlist++;
             nret++;
